@@ -1,0 +1,11 @@
+[Unit]
+Description=Run test-monitor.sh every minute (persistent)
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+Persistent=true
+Unit=test-monitor.service
+
+[Install]
+WantedBy=timers.target

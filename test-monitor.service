@@ -1,0 +1,17 @@
+[Unit]
+Description=Test process monitor (oneshot runner)
+Documentation=man:systemd.timer(5) man:systemd.service(5)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/test-monitor
+ExecStart=/usr/local/bin/test-monitor.sh
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

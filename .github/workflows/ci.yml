@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint bash
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check (bash -n)
+        run: bash -n test-monitor.sh
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Shellcheck
+        run: shellcheck -S style test-monitor.sh
+
+  build-and-test:
+    name: Build image and runtime tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        run: docker build -t test-monitor:ci .
+
+      - name: Start mock 200 server
+        run: docker run -d --name mock200 -p 18080:80 nginx:alpine
+
+      - name: Run test-monitor container (systemd)
+        run: |
+          docker run -d --name test-monitor \
+            --privileged \
+            --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            --tmpfs /run --tmpfs /run/lock \
+            test-monitor:ci
+
+      - name: Wait for systemd in container
+        run: |
+          docker exec test-monitor bash -lc 'for i in {1..30}; do systemctl is-system-running --wait && exit 0 || true; sleep 1; done; systemctl is-system-running || true'
+          docker exec test-monitor bash -lc 'systemctl status test-monitor.timer --no-pager || true'
+          docker exec test-monitor bash -lc 'systemctl list-timers | grep test-monitor || true'
+
+      - name: Healthy check (2xx should NOT add errors)
+        run: |
+          docker exec test-monitor bash -lc 'echo '\''MONITORING_URL="http://host.docker.internal:18080/"'\'' > /etc/default/test-monitor'
+          BEFORE=$(docker exec test-monitor bash -lc 'wc -l < /var/log/monitoring.log || echo 0')
+          docker exec test-monitor bash -lc 'systemctl start test-monitor.service && sleep 1'
+          AFTER=$(docker exec test-monitor bash -lc 'wc -l < /var/log/monitoring.log || echo 0')
+          echo "before=$BEFORE after=$AFTER"
+          # На 2xx записей не добавляется
+          if [ "$AFTER" -ne "$BEFORE" ]; then
+            echo "Expected no new log lines on 2xx response" && exit 1
+          fi
+
+      - name: Error check (unhealthy URL should add monitoring_error)
+        run: |
+          docker exec test-monitor bash -lc 'sed -i '\''s#^MONITORING_URL=.*#MONITORING_URL="http://host.docker.internal:19999/health"#'\'' /etc/default/test-monitor'
+          BEFORE=$(docker exec test-monitor bash -lc 'wc -l < /var/log/monitoring.log || echo 0')
+          docker exec test-monitor bash -lc 'systemctl start test-monitor.service && sleep 1'
+          AFTER=$(docker exec test-monitor bash -lc 'wc -l < /var/log/monitoring.log || echo 0')
+          echo "before=$BEFORE after=$AFTER"
+          if [ "$AFTER" -le "$BEFORE" ]; then
+            echo "Expected a new monitoring_error line on bad URL" && exit 1
+          fi
+          docker exec test-monitor bash -lc 'tail -n 5 /var/log/monitoring.log || true'
+
+      - name: Restart detection (should log restarted)
+        run: |
+          docker exec test-monitor bash -lc 'systemctl restart test-simulator.service'
+          docker exec test-monitor bash -lc 'systemctl start test-monitor.service && sleep 1'
+          docker exec test-monitor bash -lc 'tail -n 20 /var/log/monitoring.log | grep -q "event=restarted"'
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p artifacts
+          docker exec test-monitor bash -lc 'cat /var/log/monitoring.log || true' > artifacts/monitoring.log
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitoring-log
+          path: artifacts/monitoring.log
+          if-no-files-found: warn
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker logs test-monitor || true
+          docker ps -a || true
+          docker rm -f test-monitor mock200 || true

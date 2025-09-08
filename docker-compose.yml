@@ -1,0 +1,10 @@
+services:
+  test-monitor:
+    build: .
+    privileged: true
+    cgroup: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    tmpfs:
+      - /run
+      - /run/lock
