@@ -26,19 +26,22 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build image
         run: docker build -t test-monitor:ci .
 
+      - name: Create test network
+        run: docker network create testnet
+
       - name: Start mock 200 server
-        run: docker run -d --name mock200 -p 18080:80 nginx:alpine
+        run: docker run -d --name mock200 --network testnet nginx:alpine
 
       - name: Run test-monitor container (systemd)
         run: |
           docker run -d --name test-monitor \
+            --network testnet \
             --privileged \
             --cgroupns=host \
             -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
@@ -51,24 +54,28 @@ jobs:
           docker exec test-monitor bash -lc 'systemctl status test-monitor.timer --no-pager || true'
           docker exec test-monitor bash -lc 'systemctl list-timers | grep test-monitor || true'
 
+      - name: Warm up (создать лог и state)
+        run: |
+          docker exec test-monitor bash -lc 'echo '\''MONITORING_URL="http://mock200/"'\'' > /etc/default/test-monitor'
+          docker exec test-monitor bash -lc 'systemctl start test-monitor.service && sleep 1'
+
       - name: Healthy check (2xx should NOT add errors)
         run: |
-          docker exec test-monitor bash -lc 'echo '\''MONITORING_URL="http://host.docker.internal:18080/"'\'' > /etc/default/test-monitor'
-          BEFORE=$(docker exec test-monitor bash -lc 'wc -l < /var/log/monitoring.log || echo 0')
+          BEFORE=$(docker exec test-monitor bash -lc 'wc -l < /var/log/monitoring.log 2>/dev/null || echo 0')
           docker exec test-monitor bash -lc 'systemctl start test-monitor.service && sleep 1'
-          AFTER=$(docker exec test-monitor bash -lc 'wc -l < /var/log/monitoring.log || echo 0')
+          AFTER=$(docker exec test-monitor bash -lc 'wc -l < /var/log/monitoring.log 2>/dev/null || echo 0')
           echo "before=$BEFORE after=$AFTER"
-          # На 2xx записей не добавляется
+          # На 2xx новые строки появляться не должны (после прогрева)
           if [ "$AFTER" -ne "$BEFORE" ]; then
             echo "Expected no new log lines on 2xx response" && exit 1
           fi
 
       - name: Error check (unhealthy URL should add monitoring_error)
         run: |
-          docker exec test-monitor bash -lc 'sed -i '\''s#^MONITORING_URL=.*#MONITORING_URL="http://host.docker.internal:19999/health"#'\'' /etc/default/test-monitor'
-          BEFORE=$(docker exec test-monitor bash -lc 'wc -l < /var/log/monitoring.log || echo 0')
+          docker exec test-monitor bash -lc 'sed -i '\''s#^MONITORING_URL=.*#MONITORING_URL="http://nonexistent:19999/health"#'\'' /etc/default/test-monitor'
+          BEFORE=$(docker exec test-monitor bash -lc 'wc -l < /var/log/monitoring.log 2>/dev/null || echo 0')
           docker exec test-monitor bash -lc 'systemctl start test-monitor.service && sleep 1'
-          AFTER=$(docker exec test-monitor bash -lc 'wc -l < /var/log/monitoring.log || echo 0')
+          AFTER=$(docker exec test-monitor bash -lc 'wc -l < /var/log/monitoring.log 2>/dev/null || echo 0')
           echo "before=$BEFORE after=$AFTER"
           if [ "$AFTER" -le "$BEFORE" ]; then
             echo "Expected a new monitoring_error line on bad URL" && exit 1
@@ -101,3 +108,4 @@ jobs:
           docker logs test-monitor || true
           docker ps -a || true
           docker rm -f test-monitor mock200 || true
+          docker network rm testnet || true
